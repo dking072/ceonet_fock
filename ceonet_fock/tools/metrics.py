@@ -21,7 +21,7 @@ class MaskedFockMetrics(nn.Module):
     """
 
     def __init__(self,
-                 predict_name: str = 'hamiltonian_diagonal_blocks',
+                 predict_name: str = 'pred_hamiltonian_diagonal_blocks',
                  target_name:  str = 'hamiltonian_diagonal_blocks',
                  mask_name:    str = 'hamiltonian_diagonal_block_masks',
                  name: str = 'fock_diag',

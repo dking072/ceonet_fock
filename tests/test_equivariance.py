@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 from cace.representations import CEONet
 from cace.modules import BesselRBF, PolynomialCutoff
-from ceonet_fock.modules import FockDiagonalReadout
+from ceonet_fock.modules import FockDiagonalReadout, CEONetWithAtomicNumbers
 from cace.models.atomistic import NeuralNetworkPotential
 from ceonet_fock.data import QM9FockData
 
@@ -72,12 +72,12 @@ def build_model(cutoff: float) -> NeuralNetworkPotential:
     )
     fock_readout = FockDiagonalReadout(
         feature_key='node_feats_l',
-        output_key='hamiltonian_diagonal_blocks',
+        output_key='pred_hamiltonian_diagonal_blocks',
         n_channel=16,
         use_feed_forward=True,
     )
     return NeuralNetworkPotential(
-        representation=ceonet,
+        representation=CEONetWithAtomicNumbers(ceonet),
         output_modules=[fock_readout],
     )
 
@@ -115,7 +115,7 @@ def rotate_batch(batch, R: torch.Tensor):
 
 def predict(model, batch) -> torch.Tensor:
     with torch.no_grad():
-        return model(batch.clone())['hamiltonian_diagonal_blocks']  # (N, 5, 5)
+        return model(batch.clone())['pred_hamiltonian_diagonal_blocks']  # (N, 5, 5)
 
 
 # ── fixture ───────────────────────────────────────────────────────────────────

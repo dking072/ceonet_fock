@@ -2,10 +2,11 @@ from typing import Dict
 import torch
 from torch import nn
 
-from cace.modules.tensornet import (
+from .tensornet import (
     TensorFeedForward, TensorProductLayer, TensorLinearMixing,
+    RadialTensorProductLayer,
 )
-from cace.modules.tensornet_utils import expand_to, multi_outer_product
+from .tensornet_utils import expand_to, multi_outer_product
 
 __all__ = ['FockDiagonalReadout', 'FockOffDiagonalReadout']
 
@@ -30,14 +31,21 @@ class FockDiagonalReadout(nn.Module):
     def __init__(
         self,
         feature_key: str = 'node_feats_l',
-        output_key: str = 'hamiltonian_diagonal_blocks',
+        output_key: str = 'pred_hamiltonian_diagonal_blocks',
         n_channel: int = 8,
         use_feed_forward: bool = True,
+        atom_bias: bool = True,
+        atom_weights: bool = True,
+        n_elements: int = 10,
+        atomic_numbers_key: str = 'atomic_numbers',
     ):
         super().__init__()
         self.feature_key = feature_key
         self.output_key = output_key
         self.use_feed_forward = use_feed_forward
+        self.atom_bias = atom_bias
+        self.atom_weights = atom_weights and use_feed_forward
+        self.atomic_numbers_key = atomic_numbers_key
 
         self.model_outputs = [output_key]
         self.required_derivatives = []
@@ -45,14 +53,46 @@ class FockDiagonalReadout(nn.Module):
         if use_feed_forward:
             self.tensor_feed_forward = TensorFeedForward(n_channel, lomax=2)
 
-        # ss: 3 independent scalars (F_1s1s, F_1s2s, F_2s2s) — bias OK for scalars
-        self.lin_ss = nn.LazyLinear(3, bias=True)
+        if self.atom_weights:
+            # Per-element readout weights: each atom type gets its own
+            # weight matrix for mixing features into the 5x5 block output.
+            # This mirrors QHNet's `fc_ii(node_attr) -> Expansion weights`
+            # pattern but uses a simple per-element lookup table (since
+            # the element identity is already a strong signal).
+            # Shapes: (n_elements+1, out_k, n_channel)
+            C = n_channel
+            std = 1.0 / (C ** 0.5)
+            self.ss_W = nn.Parameter(torch.randn(n_elements + 1, 3, C) * std)
+            self.sp_W = nn.Parameter(torch.randn(n_elements + 1, 2, C) * std)
+            self.pp_W = nn.Parameter(torch.randn(n_elements + 1, 1, C) * std)
+        else:
+            # Global (element-agnostic) LazyLinear heads.
+            # ss: 3 independent scalars — bias OK for scalars
+            self.lin_ss = nn.LazyLinear(3, bias=True)
+            # sp: 2 vectors — no bias to preserve equivariance
+            self.lin_sp = nn.LazyLinear(2, bias=False)
+            # pp: 1 rank-2 tensor — no bias to preserve equivariance
+            self.lin_pp = nn.LazyLinear(1, bias=False)
 
-        # sp: 2 vectors (F_{1s,pα}, F_{2s,pα}) — no bias to preserve equivariance
-        self.lin_sp = nn.LazyLinear(2, bias=False)
-
-        # pp: 1 rank-2 tensor (3×3 symmetric) — no bias to preserve equivariance
-        self.lin_pp = nn.LazyLinear(1, bias=False)
+        # Atom-type-specific biases for the rotation-invariant outputs.
+        # The ss block is a 2x2 block of scalars, so each of the three
+        # independent entries (F_1s1s, F_1s2s, F_2s2s) can carry an atom
+        # baseline.  The pp block is a 3x3 symmetric tensor; only its
+        # trace is rotation-invariant, so we bias it via `b * I_3`, which
+        # adds a scalar per atom to each of the px/py/pz diagonals.  The
+        # sp block is a vector — no non-zero rotation-invariant bias is
+        # possible, so it has no atomic baseline.
+        # Biases are zero-initialised so the model at init matches the
+        # pre-atom-bias behaviour, then quickly fit the per-element mean
+        # (e.g. O's 1s-1s is ~-20 Ha, H's is ~-0.5 Ha) from the data.
+        if atom_bias:
+            self.atom_bias_ss = nn.Embedding(n_elements + 1, 3)
+            self.atom_bias_pp = nn.Embedding(n_elements + 1, 1)
+            nn.init.zeros_(self.atom_bias_ss.weight)
+            nn.init.zeros_(self.atom_bias_pp.weight)
+        else:
+            self.atom_bias_ss = None
+            self.atom_bias_pp = None
 
     def forward(self, data: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         if self.feature_key not in data:
@@ -74,31 +114,52 @@ class FockDiagonalReadout(nn.Module):
         N = f0.shape[0]
         out = torch.zeros(N, 5, 5, device=f0.device, dtype=f0.dtype)
 
+        Z = data[self.atomic_numbers_key] if (
+            self.atom_weights or self.atom_bias_ss is not None
+        ) else None
+
         # --- ss sub-block (rows/cols 0, 1) ---
         # (N, C) → (N, 3): [F_1s1s, F_1s2s, F_2s2s]
-        ss = self.lin_ss(f0)
+        if self.atom_weights:
+            W_ss = self.ss_W[Z]                             # (N, 3, C)
+            ss = torch.einsum('nc,nkc->nk', f0, W_ss)       # (N, 3)
+        else:
+            ss = self.lin_ss(f0)
+        if self.atom_bias_ss is not None:
+            ss = ss + self.atom_bias_ss(Z)                  # (N, 3)
         out[:, 0, 0] = ss[:, 0]
         out[:, 0, 1] = ss[:, 1]
         out[:, 1, 0] = ss[:, 1]  # symmetry
         out[:, 1, 1] = ss[:, 2]
 
         # --- sp sub-block (rows 0,1  ×  cols 2,3,4) ---
-        # Mix channels: (N, C, 3) → transpose → (N, 3, C) → Linear(2) → (N, 3, 2)
-        #               → transpose → (N, 2, 3)
+        # Per-atom weight mixes channel dim, keeps the spatial (3,) axis.
         # CACE [x,y,z] == PySCF [px,py,pz] — no reordering needed.
-        sp = self.lin_sp(f1.transpose(1, -1))   # (N, 3, 2)
-        sp = sp.transpose(1, -1)                # (N, 2, 3)
+        if self.atom_weights:
+            W_sp = self.sp_W[Z]                             # (N, 2, C)
+            sp = torch.einsum('ncs,nkc->nks', f1, W_sp)     # (N, 2, 3)
+        else:
+            sp = self.lin_sp(f1.transpose(1, -1))           # (N, 3, 2)
+            sp = sp.transpose(1, -1)                        # (N, 2, 3)
         out[:, 0, 2:5] = sp[:, 0]   # F_{1s, pα}
         out[:, 2:5, 0] = sp[:, 0]   # symmetry
         out[:, 1, 2:5] = sp[:, 1]   # F_{2s, pα}
         out[:, 2:5, 1] = sp[:, 1]   # symmetry
 
         # --- pp sub-block (rows/cols 2,3,4 = px,py,pz) ---
-        # Mix channels: (N, C, 3, 3) → permute → (N, 3, 3, C) → Linear(1) → (N, 3, 3, 1)
-        #               → squeeze → (N, 3, 3)
-        # CACE [x,y,z] == PySCF [px,py,pz] — no reordering needed.
-        pp = self.lin_pp(f2.permute(0, 2, 3, 1))  # (N, 3, 3, 1)
-        pp = pp.squeeze(-1)                         # (N, 3, 3)
+        # Per-atom scalar weight mixes channel dim, keeps rank-2 spatial intact.
+        if self.atom_weights:
+            W_pp = self.pp_W[Z].squeeze(1)                  # (N, C)
+            pp = torch.einsum('ncab,nc->nab', f2, W_pp)     # (N, 3, 3)
+        else:
+            pp = self.lin_pp(f2.permute(0, 2, 3, 1))        # (N, 3, 3, 1)
+            pp = pp.squeeze(-1)                             # (N, 3, 3)
+        if self.atom_bias_pp is not None:
+            # Add an atom-specific isotropic bias b_i * I_3 (rotation-invariant):
+            # it shifts the average pp-diagonal (the trace/3) per element.
+            b = self.atom_bias_pp(Z).squeeze(-1)             # (N,)
+            eye3 = torch.eye(3, device=pp.device, dtype=pp.dtype)
+            pp = pp + b[:, None, None] * eye3
         out[:, 2:5, 2:5] = pp
 
         data[self.output_key] = out
@@ -139,15 +200,17 @@ class FockOffDiagonalReadout(nn.Module):
     def __init__(
         self,
         feature_key: str = 'node_feats_l',
-        output_key: str = 'hamiltonian_non_diagonal_blocks',
+        output_key: str = 'pred_hamiltonian_non_diagonal_blocks',
         n_channel: int = 16,
         n_rbf: int = 8,
         lomax: int = 2,
         linmax: int = 2,
         use_feed_forward: bool = True,
         stacking: bool = False,
-        linear_messages: bool = True,
+        linear_messages: bool = False,
         radial_basis: nn.Module = None,
+        cutoff_fn: nn.Module = None,
+        cutoff: float = 15.0,
     ):
         super().__init__()
         self.feature_key = feature_key
@@ -163,38 +226,55 @@ class FockOffDiagonalReadout(nn.Module):
         if use_feed_forward:
             self.tensor_feed_forward = TensorFeedForward(n_channel, lomax=lomax)
 
-        # Radial basis (no cutoff -- global edges span the full molecule)
+        # Radial basis and cutoff function.  A proper cutoff (e.g.
+        # PolynomialCutoff) is important here: Fock off-diagonal couplings
+        # must decay smoothly to zero as the pair distance grows, and the
+        # RBF alone does not enforce this.
         if radial_basis is not None:
             self.radial_basis = radial_basis
         else:
             from cace.modules import BesselRBF
-            self.radial_basis = BesselRBF(cutoff=30.0, n_rbf=n_rbf, trainable=True)
+            self.radial_basis = BesselRBF(cutoff=cutoff, n_rbf=n_rbf, trainable=True)
+        if cutoff_fn is not None:
+            self.cutoff_fn = cutoff_fn
+        else:
+            from cace.modules import PolynomialCutoff
+            self.cutoff_fn = PolynomialCutoff(cutoff)
 
-        # Attention: scalar invariant from hi x hj
+        # Attention: scalar invariant from hi x hj (no edge vector, no radial)
         self.att_hi_hj  = TensorProductLayer(n_channel, max_x_way=linmax, max_y_way=linmax,
                                               max_z_way=0, stacking=True)
         self.att_hi_mix = TensorLinearMixing(n_channel, linmax)
         self.att_hj_mix = TensorLinearMixing(n_channel, linmax)
 
-        # Three-body: hi x r x hj
-        self.tp_right          = TensorProductLayer(n_channel, max_x_way=lomax,  max_y_way=linmax,
-                                                     max_z_way=lomax,  stacking=stacking)
+        # Three-body: hi x (r x hj).  tp_right takes the edge vector u as an
+        # input so it gets per-path radial weighting (each angular path gets
+        # its own learnable radial profile, QHNet-style).  tp_left combines
+        # hi with the already-radially-gated msgs and stays a plain TP.
+        self.tp_right          = RadialTensorProductLayer(
+            n_channel, n_rbf=n_rbf, max_x_way=lomax,  max_y_way=linmax,
+            max_z_way=lomax,  stacking=stacking)
         self.tp_left           = TensorProductLayer(n_channel, max_x_way=linmax, max_y_way=lomax,
                                                      max_z_way=lomax,  stacking=stacking)
         self.hi_r_hj_mix_hi    = TensorLinearMixing(n_channel, linmax)
         self.hi_r_hj_mix_r_hj  = TensorLinearMixing(n_channel, lomax)
         self.hi_r_hj_mix_hj    = TensorLinearMixing(n_channel, linmax)
 
-        # Optional linear messages: hi x r  and  r x hj
+        # Optional linear messages: hi x r  and  r x hj — both consume u, so
+        # both get per-path radial weighting.
         if linear_messages:
-            self.tp_hi_r     = TensorProductLayer(n_channel, max_x_way=linmax, max_y_way=lomax,
-                                                   max_z_way=lomax,  stacking=stacking)
+            self.tp_hi_r     = RadialTensorProductLayer(
+                n_channel, n_rbf=n_rbf, max_x_way=linmax, max_y_way=lomax,
+                max_z_way=lomax,  stacking=stacking)
             self.hi_r_mix_hi = TensorLinearMixing(n_channel, linmax)
-            self.tp_r_hj     = TensorProductLayer(n_channel, max_x_way=lomax,  max_y_way=linmax,
-                                                   max_z_way=lomax,  stacking=stacking)
+            self.tp_r_hj     = RadialTensorProductLayer(
+                n_channel, n_rbf=n_rbf, max_x_way=lomax,  max_y_way=linmax,
+                max_z_way=lomax,  stacking=stacking)
             self.r_hj_mix_hj = TensorLinearMixing(n_channel, linmax)
 
-        # Count channel multiplicity per l (mirrors MessagePassingLayer logic)
+        # Count channel multiplicity per l for the attention MLP output width.
+        # The former post-TP rbf_mixing_list is gone — its role is now inside
+        # the RadialTensorProductLayer's per-path weights.
         combo_count = {l: 0 for l in range(lomax + 1)}
         tensor_layers = [self.tp_left]
         if linear_messages:
@@ -205,13 +285,7 @@ class FockOffDiagonalReadout(nn.Module):
                 combo_count[l] += len(hits) if stacking else (1 if hits else 0)
         self.combo_count = combo_count
 
-        # RBF mixing: one Linear per l (no bias to preserve cutoff-to-zero behaviour)
-        self.rbf_mixing_list = nn.ModuleList([
-            nn.Linear(n_rbf, combo_count[l] * n_channel, bias=False)
-            for l in range(lomax + 1)
-        ])
-
-        # Attention MLPs: one per l
+        # Attention MLPs: one per l (scalar-invariant channel gate)
         def build_mlp(nout):
             return nn.Sequential(
                 nn.LazyLinear(nout), nn.SiLU(),
@@ -291,29 +365,31 @@ class FockOffDiagonalReadout(nn.Module):
         out_ji   = torch.cat(out_ji_list)
         return global_i, global_j, out_ij, out_ji, n_offdiag_total
 
-    def _calc_hi_r_hj(self, hi, u, hj):
-        """Mirrors MessagePassingLayer.calc_hi_r_hj exactly."""
-        # Scalar attention feed
+    def _calc_hi_r_hj(self, hi, u, hj, rbf):
+        """Mirrors MessagePassingLayer.calc_hi_r_hj, but the three TPs that
+        consume the edge vector u are now radial (rbf-weighted per path).
+        """
+        # Scalar attention feed (node-only, no radial)
         h1 = self.att_hi_mix(hi)
         h2 = self.att_hj_mix(hj)
         att_feed = [self.att_hi_hj(h1, h2)[0]]
 
-        # Three-body: hi x (r x hj)
+        # Three-body: hi x (r x hj).  tp_right uses u -> radial-weighted.
         h1 = self.hi_r_hj_mix_hi(hi)
         h2 = self.hi_r_hj_mix_hj(hj)
-        msgs = self.tp_right(u, h2)
+        msgs = self.tp_right(u, h2, rbf)
         msgs = self.hi_r_hj_mix_r_hj(msgs)
         msgs = self.tp_left(h1, msgs)
 
-        # Optional linear messages
+        # Optional linear messages (both consume u -> both radial-weighted)
         if self.linear_messages:
             h1 = self.hi_r_mix_hi(hi)
-            h1 = self.tp_hi_r(h1, u)
+            h1 = self.tp_hi_r(h1, u, rbf)
             for l in range(self.lomax + 1):
                 msgs[l] = torch.hstack([msgs[l], h1[l]])
 
             h1 = self.r_hj_mix_hj(hj)
-            h1 = self.tp_r_hj(u, h1)
+            h1 = self.tp_r_hj(u, h1, rbf)
             for l in range(self.lomax + 1):
                 msgs[l] = torch.hstack([msgs[l], h1[l]])
 
@@ -342,11 +418,14 @@ class FockOffDiagonalReadout(nn.Module):
         hi = {l: features[l][global_i] for l in range(self.linmax + 1)}
         hj = {l: features[l][global_j] for l in range(self.linmax + 1)}
 
-        # Global pair geometry: direction vector from i to j
+        # Global pair geometry: direction vector from i to j.  The RBF is
+        # multiplied by the cutoff function so it smoothly vanishes beyond
+        # the cutoff; combined with the radial TP layers this guarantees
+        # F_{ij} -> 0 as d_ij -> infinity.
         r_ij = positions[global_j] - positions[global_i]   # (n_pairs, 3)
         d_ij = r_ij.norm(dim=-1, keepdim=True)             # (n_pairs, 1)
         u_ij = r_ij / d_ij                                 # (n_pairs, 3)
-        rbf  = self.radial_basis(d_ij)                     # (n_pairs, n_rbf)
+        rbf  = self.radial_basis(d_ij) * self.cutoff_fn(d_ij)   # (n_pairs, n_rbf)
 
         # Radial moment tensors u[l] = outer_product(u_ij, l), broadcast over C
         ones = torch.ones(n_pairs, C, device=device, dtype=dtype)
@@ -355,14 +434,14 @@ class FockOffDiagonalReadout(nn.Module):
             for l in range(self.lomax + 1)
         }
 
-        # Edge messages via hi x r x hj (same as calc_edge_messages)
-        msgs, att_feed = self._calc_hi_r_hj(hi, u, hj)
+        # Edge messages via hi x r x hj (rbf flows into each radial TP)
+        msgs, att_feed = self._calc_hi_r_hj(hi, u, hj, rbf)
 
+        # Scalar-invariant attention gate (the former rbf post-gate is now
+        # subsumed by the per-path weights inside the radial TPs).
         for l in range(self.lomax + 1):
             attention = self.attention_net_list[l](att_feed)   # (n_pairs, combo*C)
-            rbf_mixed = self.rbf_mixing_list[l](rbf)           # (n_pairs, combo*C)
             msgs[l] = msgs[l] * expand_to(attention, l + 2)
-            msgs[l] = msgs[l] * expand_to(rbf_mixed, l + 2)
 
         f0 = msgs[0]   # (n_pairs, combo0*C)
         f1 = msgs[1]   # (n_pairs, combo1*C, 3)
